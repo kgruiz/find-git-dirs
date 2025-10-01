@@ -25,8 +25,8 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(about = "TUI scanner for all .git directories")]
 struct Args {
-    /// Output JSON after exit
-    #[arg(long)]
+    /// Output JSON after exit (default)
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "plain")]
     json: bool,
 
     /// Follow symlinks (use --no-follow-links to disable)
@@ -40,6 +40,10 @@ struct Args {
     /// Write the final results to a file instead of stdout
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
+
+    /// Output newline-delimited paths instead of JSON
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    plain: bool,
 
     /// Root path(s) to scan as positional arguments
     #[arg(value_name = "PATH", num_args = 0.., trailing_var_arg = true)]
@@ -120,8 +124,11 @@ fn main() -> Result<()> {
         follow_links,
         root,
         output,
+        plain,
         paths,
     } = Args::parse();
+
+    let json_output = !plain || json;
 
     let mut roots = if paths.is_empty() && root.is_empty() {
         os_roots()
@@ -208,7 +215,7 @@ fn main() -> Result<()> {
     execute!(out, LeaveAlternateScreen)?;
 
     // Output results
-    emit_results(&app.all_found, json, output.as_deref())?;
+    emit_results(&app.all_found, json_output, output.as_deref())?;
 
     Ok(())
 }
