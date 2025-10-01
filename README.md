@@ -4,7 +4,7 @@
 
 ## Features
 
-- Parallel filesystem scanning with per-root progress counters
+- Multi-threaded filesystem scanning with per-root progress counters
 - Live TUI powered by [ratatui](https://github.com/ratatui-org/ratatui)
 - Configurable root paths, including following or skipping symlinks
 - Recent discoveries panel to quickly inspect the latest repositories found
@@ -38,6 +38,7 @@ Key flags:
 - `<PATH>...`: provide positional paths to scan in addition to or instead of defaults
 - `--no-follow-links`: disable following symlinks (on by default)
 - `--json`: print the final list of `.git` directories as JSON instead of leaving the TUI active
+- `--output <FILE>`: write the results to a file (respects `--json` formatting)
 
 While the TUI is running:
 

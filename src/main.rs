@@ -6,7 +6,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ignore::{DirEntry, WalkBuilder};
+use ignore::{DirEntry, WalkBuilder, WalkState};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Wrap},
@@ -15,8 +15,9 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
-    io::{self, stdout},
+    io::{self, stdout, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -35,6 +36,10 @@ struct Args {
     /// Extra root(s) to scan via flag (can be repeated)
     #[arg(long, value_name = "PATH")]
     root: Vec<PathBuf>,
+
+    /// Write the final results to a file instead of stdout
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
 
     /// Root path(s) to scan as positional arguments
     #[arg(value_name = "PATH", num_args = 0.., trailing_var_arg = true)]
@@ -114,6 +119,7 @@ fn main() -> Result<()> {
         json,
         follow_links,
         root,
+        output,
         paths,
     } = Args::parse();
 
@@ -202,13 +208,7 @@ fn main() -> Result<()> {
     execute!(out, LeaveAlternateScreen)?;
 
     // Output results
-    if json {
-        print_json(&app.all_found)?;
-    } else {
-        for p in &app.all_found {
-            println!("{}", p.display());
-        }
-    }
+    emit_results(&app.all_found, json, output.as_deref())?;
 
     Ok(())
 }
@@ -349,7 +349,7 @@ fn render_recent(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let current_height = area.height.min(5).max(3);
+    let current_height = area.height.clamp(3, 5);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(current_height), Constraint::Min(3)])
@@ -403,7 +403,7 @@ fn render_recent_list(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let capacity = area.height.saturating_sub(2) as usize;
-    let window = capacity.max(1).min(12);
+    let window = capacity.clamp(1, 12);
     let start = app.recent.len().saturating_sub(window);
     let items: Vec<ListItem> = app.recent[start..]
         .iter()
@@ -453,31 +453,50 @@ fn scan_root(root_idx: usize, root: &Path, follow_links: bool, tx: Sender<Msg>) 
         path: root.to_path_buf(),
     });
     let throttle = Duration::from_millis(120);
-    let mut last_progress = Instant::now();
+    let last_progress = Arc::new(Mutex::new(Instant::now()));
 
-    for ent in wb.build() {
-        match ent {
-            Ok(e) => {
-                let _ = tx.send(Msg::Scanned { root_idx });
-                let now = Instant::now();
-                if now.duration_since(last_progress) >= throttle {
-                    let _ = tx.send(Msg::Progress {
-                        root_idx,
-                        path: e.path().to_path_buf(),
-                    });
-                    last_progress = now;
+    wb.build_parallel().run(|| {
+        let txc = tx.clone();
+        let last_progress = Arc::clone(&last_progress);
+        Box::new(move |result| {
+            match result {
+                Ok(entry) => {
+                    let _ = txc.send(Msg::Scanned { root_idx });
+                    let now = Instant::now();
+                    let should_report = {
+                        if let Ok(mut last) = last_progress.lock() {
+                            if now.duration_since(*last) >= throttle {
+                                *last = now;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+
+                    let path_buf = entry.path().to_path_buf();
+                    if should_report {
+                        let _ = txc.send(Msg::Progress {
+                            root_idx,
+                            path: path_buf.clone(),
+                        });
+                    }
+
+                    if is_git_dir(&entry) {
+                        let path = canonical_dir(entry.path()).unwrap_or_else(|_| path_buf.clone());
+                        let _ = txc.send(Msg::Found { root_idx, path });
+                    }
                 }
-                if is_git_dir(&e) {
-                    let path = canonical_dir(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
-                    let _ = tx.send(Msg::Found { root_idx, path });
+                Err(_) => {
+                    // ignore permission or IO errors, just keep going
+                    let _ = txc.send(Msg::Scanned { root_idx });
                 }
             }
-            Err(_) => {
-                // ignore permission or IO errors, just keep going
-                let _ = tx.send(Msg::Scanned { root_idx });
-            }
-        }
-    }
+            WalkState::Continue
+        })
+    });
 
     let _ = tx.send(Msg::Done { root_idx });
 }
@@ -517,22 +536,56 @@ fn os_roots() -> Vec<PathBuf> {
     vec![PathBuf::from("/")]
 }
 
-fn print_json(paths: &[PathBuf]) -> Result<()> {
-    let mut out = String::from("[");
+fn emit_results(paths: &[PathBuf], json: bool, output: Option<&Path>) -> Result<()> {
+    match output {
+        Some(dest) => write_results(dest, json, paths),
+        None if json => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            write_json(&mut handle, paths)
+        }
+        None => {
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            for p in paths {
+                writeln!(handle, "{}", p.display())?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn write_results(path: &Path, json: bool, paths: &[PathBuf]) -> Result<()> {
+    let file = fs::File::create(path)?;
+    let mut writer = io::BufWriter::new(file);
+    if json {
+        write_json(&mut writer, paths)?;
+    } else {
+        for p in paths {
+            writeln!(writer, "{}", p.display())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_json<W: Write>(mut writer: W, paths: &[PathBuf]) -> Result<()> {
+    writer.write_all(b"[")?;
     for (i, p) in paths.iter().enumerate() {
         if i > 0 {
-            out.push(',');
+            writer.write_all(b",")?;
         }
-        let s = p
-            .display()
-            .to_string()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        out.push('"');
-        out.push_str(&s);
-        out.push('"');
+        writer.write_all(b"\"")?;
+        writer.write_all(escape_json_path(p).as_bytes())?;
+        writer.write_all(b"\"")?;
     }
-    out.push(']');
-    println!("{}", out);
+    writer.write_all(b"]\n")?;
     Ok(())
+}
+
+fn escape_json_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
