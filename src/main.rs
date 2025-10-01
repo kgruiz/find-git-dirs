@@ -9,7 +9,7 @@ use crossterm::{
 use ignore::{DirEntry, WalkBuilder};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use std::{
     collections::HashSet,
@@ -47,6 +47,7 @@ struct RootState {
     scanned: u64,
     found: u64,
     done: bool,
+    current: Option<PathBuf>,
 }
 
 impl RootState {
@@ -56,12 +57,14 @@ impl RootState {
             scanned: 0,
             found: 0,
             done: false,
+            current: None,
         }
     }
 }
 
 enum Msg {
     Scanned { root_idx: usize },
+    Progress { root_idx: usize, path: PathBuf },
     Found { root_idx: usize, path: PathBuf },
     Done { root_idx: usize },
 }
@@ -149,6 +152,9 @@ fn main() -> Result<()> {
                 Ok(Msg::Scanned { root_idx }) => {
                     app.roots[root_idx].scanned = app.roots[root_idx].scanned.saturating_add(1);
                 }
+                Ok(Msg::Progress { root_idx, path }) => {
+                    app.roots[root_idx].current = Some(path);
+                }
                 Ok(Msg::Found { root_idx, path }) => {
                     if app.seen_found.insert(path.clone()) {
                         app.roots[root_idx].found = app.roots[root_idx].found.saturating_add(1);
@@ -158,6 +164,7 @@ fn main() -> Result<()> {
                 }
                 Ok(Msg::Done { root_idx }) => {
                     app.roots[root_idx].done = true;
+                    app.roots[root_idx].current = None;
                 }
                 Err(_) => break,
             }
@@ -209,12 +216,25 @@ fn main() -> Result<()> {
 fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
 
+    let header_height = 3;
+    let min_recent_height = 4;
+    let desired_root_height = if app.roots.len() <= 1 {
+        4
+    } else {
+        app.roots.len() as u16 + 3
+    };
+    let available_for_roots = area
+        .height
+        .saturating_sub(header_height + min_recent_height)
+        .max(3);
+    let root_height = desired_root_height.min(available_for_roots);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(6),
-            Constraint::Length(8),
+            Constraint::Length(header_height),
+            Constraint::Length(root_height),
+            Constraint::Min(min_recent_height),
         ])
         .split(area);
 
@@ -240,17 +260,63 @@ fn draw(f: &mut Frame, app: &App) {
     .block(Block::default().borders(Borders::ALL).title("find-git-dirs"));
     f.render_widget(header, chunks[0]);
 
-    // Per-root table
-    let rows: Vec<Row> = app
-        .roots
+    render_root_panel(f, app, chunks[1]);
+    render_recent(f, app, chunks[2]);
+}
+
+fn render_root_panel(f: &mut Frame, app: &App, area: Rect) {
+    if app.roots.len() == 1 {
+        render_single_root(f, &app.roots[0], area);
+    } else {
+        render_root_table(f, &app.roots, area);
+    }
+}
+
+fn render_single_root(f: &mut Frame, root: &RootState, area: Rect) {
+    let status = if root.done { "done" } else { "scanning" };
+    let current = if root.done {
+        "complete".to_string()
+    } else {
+        root.current
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "starting…".to_string())
+    };
+
+    let lines = vec![
+        Line::from(root.path.display().to_string()),
+        Line::from(format!(
+            "status: {}   scanned: {}   found: {}",
+            status, root.scanned, root.found
+        )),
+        Line::from(format!("current: {}", current)),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("root"))
+        .wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+fn render_root_table(f: &mut Frame, roots: &[RootState], area: Rect) {
+    let rows: Vec<Row> = roots
         .iter()
         .map(|r| {
-            let s = if r.done { "done" } else { "…" };
+            let status = if r.done { "done" } else { "…" };
+            let current = if r.done {
+                "complete".to_string()
+            } else {
+                r.current
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "…".to_string())
+            };
             Row::new(vec![
                 r.path.display().to_string(),
                 r.scanned.to_string(),
                 r.found.to_string(),
-                s.to_string(),
+                status.to_string(),
+                current,
             ])
         })
         .collect();
@@ -258,38 +324,109 @@ fn draw(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(60),
+            Constraint::Percentage(30),
             Constraint::Length(12),
             Constraint::Length(10),
             Constraint::Length(8),
+            Constraint::Percentage(40),
         ],
     )
     .header(
-        Row::new(vec!["root", "scanned", "found", "status"])
+        Row::new(vec!["root", "scanned", "found", "status", "current path"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::ALL).title("roots"));
-    f.render_widget(table, chunks[1]);
+    f.render_widget(table, area);
+}
 
-    // Recent finds
-    let start = if app.recent.len() > 12 {
-        app.recent.len() - 12
+fn render_recent(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    if area.height <= 5 {
+        render_current_paths(f, app, area);
+        return;
+    }
+
+    let current_height = area.height.min(5).max(3);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(current_height), Constraint::Min(3)])
+        .split(area);
+
+    render_current_paths(f, app, chunks[0]);
+    render_recent_list(f, app, chunks[1]);
+}
+
+fn render_current_paths(f: &mut Frame, app: &App, area: Rect) {
+    let mut lines = Vec::new();
+    if app.roots.is_empty() {
+        lines.push(Line::from("no roots queued"));
     } else {
-        0
-    };
+        for root in &app.roots {
+            let marker = if root.done { "✓" } else { "▶" };
+            let current = if root.done {
+                "complete".to_string()
+            } else {
+                root.current
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "starting scan".to_string())
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}", root.path.display()),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(marker),
+                Span::raw(" → "),
+                Span::raw(current),
+            ]));
+        }
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("current traversal"),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(paragraph, area);
+}
+
+fn render_recent_list(f: &mut Frame, app: &App, area: Rect) {
+    if area.height < 3 {
+        return;
+    }
+
+    let capacity = area.height.saturating_sub(2) as usize;
+    let window = capacity.max(1).min(12);
+    let start = app.recent.len().saturating_sub(window);
     let items: Vec<ListItem> = app.recent[start..]
         .iter()
         .rev()
-        .take(12)
+        .take(window)
         .map(|p| ListItem::new(p.display().to_string()))
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("recent .git found (newest first)"),
-    );
-    f.render_widget(list, chunks[2]);
+    if items.is_empty() {
+        let placeholder = Paragraph::new("no .git directories found yet").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("recent .git found"),
+        );
+        f.render_widget(placeholder, area);
+    } else {
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("recent .git found (newest first)"),
+        );
+        f.render_widget(list, area);
+    }
 }
 
 fn spawn_scanners(roots: &[PathBuf], follow_links: bool, tx: Sender<Msg>) -> Result<()> {
@@ -311,10 +448,25 @@ fn scan_root(root_idx: usize, root: &Path, follow_links: bool, tx: Sender<Msg>) 
         .git_exclude(false)
         .follow_links(follow_links);
 
+    let _ = tx.send(Msg::Progress {
+        root_idx,
+        path: root.to_path_buf(),
+    });
+    let throttle = Duration::from_millis(120);
+    let mut last_progress = Instant::now();
+
     for ent in wb.build() {
         match ent {
             Ok(e) => {
                 let _ = tx.send(Msg::Scanned { root_idx });
+                let now = Instant::now();
+                if now.duration_since(last_progress) >= throttle {
+                    let _ = tx.send(Msg::Progress {
+                        root_idx,
+                        path: e.path().to_path_buf(),
+                    });
+                    last_progress = now;
+                }
                 if is_git_dir(&e) {
                     let path = canonical_dir(e.path()).unwrap_or_else(|_| e.path().to_path_buf());
                     let _ = tx.send(Msg::Found { root_idx, path });
