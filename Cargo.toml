@@ -11,17 +11,3 @@ crossbeam-channel = "0.5"
 ignore = "0.4"
 rayon = "1.10"
 ratatui = "0.28"
-chardetng = "0.1"
-encoding_rs = "0.8"
-glob = "0.3"
-indicatif = "0.17"
-indexmap = { version = "2.2", features = ["serde"] }
-lazy_static = "1.4"
-regex = "1.10"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "ansi", "env-filter"] }
-tiktoken-rs = "0.6"
-walkdir = "2.5"
