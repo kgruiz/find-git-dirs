@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: cargo is required but was not found in PATH." >&2
+  echo "Install Rust via https://rustup.rs/ and ensure cargo is available." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+printf 'Installing find-git-dirs from %s\n' "$SCRIPT_DIR"
+
+cargo install --path "$SCRIPT_DIR" --locked --force "$@"
+
+printf 'find-git-dirs installation complete.\n'

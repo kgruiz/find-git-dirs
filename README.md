@@ -12,7 +12,13 @@
 
 ## Installation
 
-You need a recent stable Rust toolchain with `cargo` installed. Install via `cargo install --path .` from a clone of this repository or build locally with `cargo build --release`.
+You need a recent stable Rust toolchain with `cargo` installed. From a clone of this repository, run the helper script to install or update the binary:
+
+```sh
+./install
+```
+
+If you prefer to call cargo directly, the equivalent command is:
 
 ```sh
 cargo install --path .
