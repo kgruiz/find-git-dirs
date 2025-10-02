@@ -147,6 +147,11 @@ fn main() -> Result<()> {
     let (tx, rx) = bounded::<Msg>(1024);
     spawn_scanners(&roots, follow_links, tx)?;
 
+    let mut live_output = match output.as_ref() {
+        Some(dest) => Some(LiveOutput::new(dest, json_output)?),
+        None => None,
+    };
+
     // TUI setup
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -160,26 +165,28 @@ fn main() -> Result<()> {
     // Event loop
     loop {
         // Drain messages fast before drawing
-        loop {
-            match rx.try_recv() {
-                Ok(Msg::Scanned { root_idx }) => {
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                Msg::Scanned { root_idx } => {
                     app.roots[root_idx].scanned = app.roots[root_idx].scanned.saturating_add(1);
                 }
-                Ok(Msg::Progress { root_idx, path }) => {
+                Msg::Progress { root_idx, path } => {
                     app.roots[root_idx].current = Some(path);
                 }
-                Ok(Msg::Found { root_idx, path }) => {
+                Msg::Found { root_idx, path } => {
                     if app.seen_found.insert(path.clone()) {
                         app.roots[root_idx].found = app.roots[root_idx].found.saturating_add(1);
                         app.push_recent(path.clone());
-                        app.all_found.push(path);
+                        app.all_found.push(path.clone());
+                        if let Some(writer) = live_output.as_mut() {
+                            writer.record(&path)?;
+                        }
                     }
                 }
-                Ok(Msg::Done { root_idx }) => {
+                Msg::Done { root_idx } => {
                     app.roots[root_idx].done = true;
                     app.roots[root_idx].current = None;
                 }
-                Err(_) => break,
             }
         }
 
@@ -215,7 +222,11 @@ fn main() -> Result<()> {
     execute!(out, LeaveAlternateScreen)?;
 
     // Output results
-    emit_results(&app.all_found, json_output, output.as_deref())?;
+    if let Some(writer) = live_output.as_mut() {
+        writer.finalize()?;
+    } else {
+        emit_results(&app.all_found, json_output, None)?;
+    }
 
     Ok(())
 }
@@ -595,4 +606,72 @@ fn escape_json_path(path: &Path) -> String {
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+struct LiveOutput {
+    inner: LiveOutputKind,
+}
+
+enum LiveOutputKind {
+    Json {
+        writer: io::BufWriter<fs::File>,
+        first: bool,
+    },
+    Plain {
+        writer: io::BufWriter<fs::File>,
+    },
+}
+
+impl LiveOutput {
+    fn new(path: &Path, json: bool) -> Result<Self> {
+        let file = fs::File::create(path)?;
+        let mut writer = io::BufWriter::new(file);
+        let inner = if json {
+            writer.write_all(b"[")?;
+            LiveOutputKind::Json {
+                writer,
+                first: true,
+            }
+        } else {
+            LiveOutputKind::Plain { writer }
+        };
+        Ok(Self { inner })
+    }
+
+    fn record(&mut self, path: &Path) -> Result<()> {
+        match &mut self.inner {
+            LiveOutputKind::Json { writer, first } => {
+                if !*first {
+                    writer.write_all(b",")?;
+                }
+                writer.write_all(b"\n  \"")?;
+                writer.write_all(escape_json_path(path).as_bytes())?;
+                writer.write_all(b"\"")?;
+                writer.flush()?;
+                *first = false;
+            }
+            LiveOutputKind::Plain { writer } => {
+                writeln!(writer, "{}", path.display())?;
+                writer.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        match &mut self.inner {
+            LiveOutputKind::Json { writer, first } => {
+                if *first {
+                    writer.write_all(b"]\n")?;
+                } else {
+                    writer.write_all(b"\n]\n")?;
+                }
+                writer.flush()?;
+            }
+            LiveOutputKind::Plain { writer } => {
+                writer.flush()?;
+            }
+        }
+        Ok(())
+    }
 }
