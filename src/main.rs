@@ -84,6 +84,8 @@ struct App {
     recent: Vec<PathBuf>,
     all_found: Vec<PathBuf>,
     seen_found: HashSet<PathBuf>,
+    auto_exit_deadline: Option<Instant>,
+    auto_exit_cancelled: bool,
 }
 
 impl App {
@@ -94,6 +96,8 @@ impl App {
             recent: Vec::new(),
             all_found: Vec::new(),
             seen_found: HashSet::new(),
+            auto_exit_deadline: None,
+            auto_exit_cancelled: false,
         }
     }
 
@@ -116,7 +120,29 @@ impl App {
             self.recent.drain(0..over);
         }
     }
+
+    fn refresh_auto_exit(&mut self, now: Instant) {
+        if self.all_done() {
+            if !self.auto_exit_cancelled && self.auto_exit_deadline.is_none() {
+                self.auto_exit_deadline = Some(now + Duration::from_millis(AUTO_EXIT_GRACE_MS));
+            }
+        } else {
+            self.auto_exit_deadline = None;
+            self.auto_exit_cancelled = false;
+        }
+    }
+
+    fn should_auto_exit(&self, now: Instant) -> bool {
+        matches!(self.auto_exit_deadline, Some(deadline) if now >= deadline)
+    }
+
+    fn cancel_auto_exit(&mut self) {
+        self.auto_exit_deadline = None;
+        self.auto_exit_cancelled = true;
+    }
 }
+
+const AUTO_EXIT_GRACE_MS: u64 = 1000;
 
 fn main() -> Result<()> {
     let Args {
@@ -190,12 +216,22 @@ fn main() -> Result<()> {
             }
         }
 
+        let now = Instant::now();
+        app.refresh_auto_exit(now);
         terminal.draw(|f| draw(f, &app))?;
+
+        if app.should_auto_exit(Instant::now()) {
+            break;
+        }
 
         // Exit if user quits or all done and user hits Enter
         select! {
             recv(tick_rate) -> _ => {},
             default => {}
+        }
+
+        if app.should_auto_exit(Instant::now()) {
+            break;
         }
 
         if event::poll(Duration::from_millis(10))? {
@@ -205,14 +241,17 @@ fn main() -> Result<()> {
                     KeyCode::Char('c') if k.modifiers.contains(event::KeyModifiers::CONTROL) => {
                         break
                     }
-                    _ => {}
+                    _ => {
+                        if app.all_done() {
+                            app.cancel_auto_exit();
+                        }
+                    }
                 }
             }
         }
 
-        if app.all_done() && app.total_scanned() > 0 {
-            // Give user a moment to view, then exit on auto-complete if no key press
-            // Non-blocking; continue loop until user quits.
+        if app.should_auto_exit(Instant::now()) {
+            break;
         }
     }
 
